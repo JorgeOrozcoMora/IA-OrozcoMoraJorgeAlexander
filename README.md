@@ -5,3 +5,5 @@
 - [Ejercicio 1 A*](Unidad_1/Ejercicio1_A.jpg)
 - [Ejercicio 2 A*](Unidad_1/Ejercicio2_A.jpg)
 - [Evaluacion A*](Unidad_1/EvaluacionA_Orozco_Jorge.jpeg)
+- [Problemas](Unidad_1/Problemas.md)
+- [EDA Identificar Numeros 1,2,3](Unidad_1/EDA_Identificar_123.md)
