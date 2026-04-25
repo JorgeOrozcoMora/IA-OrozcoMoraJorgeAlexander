@@ -11,6 +11,8 @@
 - [EDA Identificar Numeros 1,2,3](Unidad_1/EDA_Identificar_123.md)
 - [Ejercicio Convolusion](Unidad_1/Ejercicio_Convolusion.png)
 - [10 Pruebas CNN](Unidad_1/Pruebas_CNN.md)
-
+- [Practica Cero](Unidad_1/Practica_Cero.md)
+- [Actividad RNN Basica Vanilla](Unidad_1/Actividad_RNN.md)
+- [Actividad 2](Unidad_1/Actividad_2.md)
 ### PROYECTOS
 - [Proyecto 1 Juego](Proyecto_1_Juego/)
