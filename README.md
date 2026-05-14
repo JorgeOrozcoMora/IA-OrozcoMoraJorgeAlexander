@@ -15,4 +15,5 @@
 - [Actividad RNN Basica Vanilla](Unidad_1/Actividad_RNN.md)
 - [Actividad 2](Unidad_1/Actividad_2.md)
 ### PROYECTOS
-- [Proyecto 1 Juego](Proyecto_1_Juego/)
+- [Proyecto 1 - Juego](Proyecto_1_Juego/)
+- [Proyecto 2 - CNN](Proyecto_2_CNN/)
