@@ -21,3 +21,4 @@
 - [Proyecto 1 - Juego](Proyecto_1_Juego/)
 - [Proyecto 2 - CNN](Proyecto_2_CNN/)
 - [Proyecto 3 - RNN](Proyecto_3_RNN/)
+- [Proyecto 3 - RNN](Proyecto_4_RAG_FineTuning/)
