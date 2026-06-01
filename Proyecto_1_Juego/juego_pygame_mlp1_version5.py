@@ -1,6 +1,7 @@
 import os
 import csv
 import random
+from collections import Counter
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -35,7 +36,7 @@ EXTRA_SCALE = 1.1
 @dataclass
 class Sample:
     velocidad_bala: float
-    distancia: float
+    distancia: float       # distancia firmada bala-jugador: >0 viene de frente, <0 ya paso
     altura_bala: float   # altura relativa de la bala (0.0=suelo, 1.0=nivel medio-cuerpo)
     accion: int  # 0=nada, 1=saltar, 2=agacharse
 
@@ -73,8 +74,10 @@ class Juego:
         # Caso especial: cuando solo hay una clase en los datos
         # (0 = nunca salto, 1 = siempre salto).
         self.clase_unica: Optional[int] = None
+        self.accion_mayoritaria_desbalance: Optional[int] = None
         # Debug / info del modelo en tiempo real
         self.ultima_proba_salto: Optional[float] = None
+        self.ultima_proba_agacharse: Optional[float] = None
 
         # Parámetros de decisión
         self.decision_window = 500
@@ -98,6 +101,11 @@ class Juego:
         self.salto_vel_inicial = 15.0
         self.gravedad = 1.0
         self.salto_vel = self.salto_vel_inicial
+        # Timer para agachado automático (0 = sin timer / agachado manual indefinido)
+        self.crouch_timer = 0
+        self.crouch_duration = 8   # ~0.18 s a 45 fps — corto para permitir múltiples agachadas
+        self.agachadas_desde_disparo = 0
+        self.distancia_ultima_agachada_manual: Optional[float] = None
 
         self.current_frame = 0
         self.frame_speed = 10
@@ -220,6 +228,9 @@ class Juego:
         self.agachado = False
         self.en_suelo = True
         self.salto_vel = self.salto_vel_inicial
+        self.crouch_timer = 0
+        self.agachadas_desde_disparo = 0
+        self.distancia_ultima_agachada_manual = None
         self._decision_frame_counter = 0
         self.fondo_x1 = 0
         self.fondo_x2 = self.w
@@ -229,6 +240,7 @@ class Juego:
         self.scaler = None
         self.modelo_entrenado = False
         self.clase_unica = None
+        self.accion_mayoritaria_desbalance = None
 
     # ----------------- export / gráficas -----------------
 
@@ -275,7 +287,7 @@ class Juego:
 
         ax = plt.gca()
         ax.scatter(xs, ys, c=cs, alpha=0.6, edgecolors="k", s=30)
-        ax.set_xlabel("Distancia jugador-bala")
+        ax.set_xlabel("Distancia firmada bala-jugador")
         ax.set_ylabel("Velocidad bala")
         ax.set_title("Datos MLP (azul=nada, rojo=salto, verde=agacha)")
         ax.grid(True, alpha=0.3)
@@ -307,7 +319,7 @@ class Juego:
         # Crear eje 3D correctamente desde la figura
         ax = fig.add_subplot(111, projection="3d")
         ax.scatter(xs, ys, zs, c=cs, alpha=0.6, edgecolors="k", s=30)
-        ax.set_xlabel("Distancia")
+        ax.set_xlabel("Distancia firmada")
         ax.set_ylabel("Velocidad bala")
         ax.set_zlabel("Altura bala")
         ax.set_title("Datos MLP 3D (azul=nada, rojo=salto, verde=agacha)")
@@ -331,31 +343,71 @@ class Juego:
                 # Bala a mitad de cuerpo (nivel medio — hay que agacharse)
                 self.bala.y = self.ground_y - self.bala_altura_media + int(14 * self.scale)
             self.bala_disparada = True
+            self.agachadas_desde_disparo = 0
+            self.distancia_ultima_agachada_manual = None
 
     def reset_bala(self) -> None:
         self.bala.x = self.w - self.margin
         self.bala_disparada = False
+        self.agachadas_desde_disparo = 0
+        self.distancia_ultima_agachada_manual = None
 
     def iniciar_salto(self) -> None:
         if self.en_suelo and not self.agachado:
             self.salto = True
             self.en_suelo = False
 
+    def registrar_agachada_manual(self) -> None:
+        """Cuenta las veces que el jugador toca ↓ durante la bala actual."""
+        if self.bala_disparada:
+            self.agachadas_desde_disparo += 1
+            self.distancia_ultima_agachada_manual = self.distancia_bala_jugador()
+
     def iniciar_agacharse(self) -> None:
-        """Activa el estado agachado (solo si está en suelo y no saltando)."""
+        """Agachado MANUAL: dura hasta que el jugador suelte la tecla (↓).
+        timer=0 significa sin límite de tiempo."""
         if self.en_suelo and not self.salto:
             if not self.agachado:
                 self.agachado = True
-                # Encogemos el rect del jugador y lo bajamos para que quede pegado al suelo
+                self.crouch_timer = 0  # sin timer: permanece hasta KEYUP
                 self.jugador.height = self.player_size_agachado[1]
                 self.jugador.y = self.ground_y + (self.player_size[1] - self.player_size_agachado[1])
 
+    def iniciar_agacharse_auto(self) -> None:
+        """Agachado AUTOMÁTICO para BALA BAJA: ciclos cortos y distintos (agacha→levanta→agacha),
+        igual a presionar ↓ múltiples veces. Solo inicia cuando la agachada anterior ya terminó."""
+        if self.en_suelo and not self.salto and not self.agachado:
+            self.agachado = True
+            self.crouch_timer = self.crouch_duration
+            self.jugador.height = self.player_size_agachado[1]
+            self.jugador.y = self.ground_y + (self.player_size[1] - self.player_size_agachado[1])
+
+    def iniciar_agacharse_auto_sostenido(self) -> None:
+        """Agachado AUTOMÁTICO para BALA ALTA: el personaje se queda agachado mientras el modelo
+        prediga accion=2, igual a mantener presionada la flecha ↓. Reinicia el timer cada frame."""
+        if self.en_suelo and not self.salto:
+            if not self.agachado:
+                self.agachado = True
+                self.jugador.height = self.player_size_agachado[1]
+                self.jugador.y = self.ground_y + (self.player_size[1] - self.player_size_agachado[1])
+            # Reiniciar timer cada frame = mantenerse agachado continuamente
+            self.crouch_timer = self.crouch_duration
+
     def terminar_agacharse(self) -> None:
-        """Desactiva el estado agachado."""
+        """Desactiva el estado agachado y resetea el timer."""
         if self.agachado:
             self.agachado = False
+            self.crouch_timer = 0
             self.jugador.height = self.player_size[1]
             self.jugador.y = self.ground_y
+
+    def manejar_agacharse(self) -> None:
+        """Descuenta el timer de agachado automático.
+        Solo actúa cuando timer > 0 (agachado manual con timer=0 se ignora: dura hasta KEYUP)."""
+        if self.agachado and self.crouch_timer > 0:
+            self.crouch_timer -= 1
+            if self.crouch_timer <= 0:
+                self.terminar_agacharse()
 
     def manejar_salto(self) -> None:
         if self.salto:
@@ -369,16 +421,32 @@ class Juego:
                 self.en_suelo = True
 
     # ----------------- datos / ML -----------------
+    def distancia_bala_jugador(self) -> float:
+        """Distancia horizontal firmada: positiva si la bala viene de frente."""
+        return float(self.bala.x - self.jugador.x)
+
+    def bala_alta_sobre_jugador(self) -> bool:
+        """True mientras una bala alta aun esta cruzando por encima del jugador."""
+        if self.altura_bala_relativa != 1.0:
+            return False
+        margen = int(4 * self.scale)
+        return self.bala.right >= self.jugador.left - margen and self.bala.left <= self.jugador.right + margen
+
     def registrar_decision_manual(self) -> None:
         """Registra la acción del jugador en el frame actual.
         accion: 0=nada, 1=saltando, 2=agachado
         """
         if not self.bala_disparada:
             return
-        distancia = abs(self.jugador.x - self.bala.x)
+        distancia = self.distancia_bala_jugador()
         if not self.en_suelo and self.salto:
             accion = 1
-        elif self.agachado:
+        elif self.agachado or (
+            self.agachadas_desde_disparo >= 2
+            and self.distancia_ultima_agachada_manual is not None
+            and distancia <= self.distancia_ultima_agachada_manual
+            and distancia > -self.player_size[0]
+        ):
             accion = 2
         else:
             accion = 0
@@ -390,6 +458,35 @@ class Juego:
                 accion=accion,
             )
         )
+
+    def balancear_samples(self, samples: List[Sample]) -> List[Sample]:
+        """Duplica clases minoritarias para que el MLP no ignore saltar/agacharse."""
+        por_clase = {clase: [s for s in samples if s.accion == clase] for clase in set(s.accion for s in samples)}
+        max_count = max(len(grupo) for grupo in por_clase.values())
+        rng = random.Random(42)
+        balanceados: List[Sample] = []
+        for clase in sorted(por_clase):
+            grupo = por_clase[clase]
+            balanceados.extend(grupo)
+            faltan = max_count - len(grupo)
+            if faltan > 0:
+                balanceados.extend(rng.choice(grupo) for _ in range(faltan))
+        rng.shuffle(balanceados)
+        return balanceados
+
+    def accion_mayoritaria_si_desbalance(self, conteo: Counter) -> Optional[int]:
+        """Detecta si saltar/agacharse estan desbalanceados en los datos originales."""
+        saltos = conteo.get(1, 0)
+        agachadas = conteo.get(2, 0)
+        if saltos == agachadas:
+            return None
+        if saltos == 0 or agachadas == 0:
+            return 1 if saltos > agachadas else 2
+        minoritaria = min(saltos, agachadas)
+        mayoritaria = max(saltos, agachadas)
+        if mayoritaria >= minoritaria * 3:
+            return 1 if saltos > agachadas else 2
+        return None
 
     def entrenar_modelo(self) -> Tuple[bool, str]:
         samples = list(self.datos_modelo)
@@ -404,8 +501,14 @@ class Juego:
             self._reset_modelo()
             self.clase_unica = int(clases[0])
             self.modelo_entrenado = True
+            self.accion_mayoritaria_desbalance = self.clase_unica if self.clase_unica in (1, 2) else None
             nombres = {0: "NADA", 1: "SIEMPRE SALTA", 2: "SIEMPRE AGACHA"}
             return True, f"Modelo trivial: {nombres.get(self.clase_unica, '?')}. Varía tus acciones para mejor modelo."
+        conteo_original = Counter(y)
+        accion_mayoritaria = self.accion_mayoritaria_si_desbalance(conteo_original)
+        samples = self.balancear_samples(samples)
+        X = [[s.velocidad_bala, s.distancia, s.altura_bala] for s in samples]
+        y = [s.accion for s in samples]
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=0.2, random_state=42, stratify=y
         )
@@ -425,7 +528,8 @@ class Juego:
         self.scaler = scaler
         self.modelo = clf
         self.modelo_entrenado = True
-        return True, f"MLP entrenado (3 clases). Accuracy test ≈ {acc:.3f}"
+        self.accion_mayoritaria_desbalance = accion_mayoritaria
+        return True, f"MLP entrenado. Accuracy test ≈ {acc:.3f} | datos: {dict(conteo_original)}"
 
     def decision_auto(self) -> int:
         """Retorna la acción predicha: 0=nada, 1=saltar, 2=agacharse."""
@@ -433,11 +537,12 @@ class Juego:
             return 0
         if not self.bala_disparada:
             return 0
-        distancia = abs(self.jugador.x - self.bala.x)
+        distancia = self.distancia_bala_jugador()
 
         # Caso especial: modelo trivial de una sola clase
         if self.clase_unica is not None and self.modelo is None:
             self.ultima_proba_salto = 1.0 if self.clase_unica == 1 else 0.0
+            self.ultima_proba_agacharse = 1.0 if self.clase_unica == 2 else 0.0
             return int(self.clase_unica)
 
         # Caso normal: modelo MLP con scaler
@@ -452,8 +557,14 @@ class Juego:
             probas = self.modelo.predict_proba(Xs)[0]
             clases = list(self.modelo.classes_)
             self.ultima_proba_salto = float(probas[clases.index(1)]) if 1 in clases else 0.0
+            self.ultima_proba_agacharse = float(probas[clases.index(2)]) if 2 in clases else 0.0
         else:
             self.ultima_proba_salto = 1.0 if accion == 1 else 0.0
+            self.ultima_proba_agacharse = 1.0 if accion == 2 else 0.0
+        if self.agachado and self.bala_alta_sobre_jugador():
+            return 2
+        if self.accion_mayoritaria_desbalance in (1, 2):
+            return int(self.accion_mayoritaria_desbalance)
         return accion
 
     # ----------------- menú -----------------
@@ -617,6 +728,7 @@ class Juego:
                     elif e.key == pygame.K_SPACE and not self.modo_auto:
                         self.iniciar_salto()
                     elif e.key == pygame.K_DOWN and not self.modo_auto:
+                        self.registrar_agachada_manual()
                         self.iniciar_agacharse()
                 elif e.type == pygame.KEYUP:
                     if e.key == pygame.K_DOWN and not self.modo_auto:
@@ -627,20 +739,30 @@ class Juego:
 
             if self.modo_auto:
                 accion = self.decision_auto()
-                if accion == 1 and self.en_suelo:
+                if accion == 1 and self.en_suelo and not self.agachado:
                     self.iniciar_salto()
-                elif accion == 2 and self.en_suelo:
-                    self.iniciar_agacharse()
-                else:
-                    # Si el modelo ya no predice agacharse y estábamos agachados, levantarse
-                    if self.agachado and accion != 2:
-                        self.terminar_agacharse()
+                elif accion == 2 and self.en_suelo and not self.salto:
+                    if self.altura_bala_relativa == 1.0:
+                        # Bala ALTA: se queda agachado mientras pasa la bala por encima
+                        # (replica mantener ↓ presionado, sin ciclos de agacha→levanta)
+                        if self.bala_alta_sobre_jugador():
+                            self.iniciar_agacharse_auto_sostenido()
+                        else:
+                            self.iniciar_agacharse_auto()
+                    else:
+                        # Bala BAJA: ciclos cortos agacha→levanta
+                        # (replica presionar ↓ varias veces)
+                        self.iniciar_agacharse_auto()
+                # El timer de manejar_agacharse() se encarga de terminar el agachado automáticamente
             else:
                 # En modo manual registramos la decisión de este frame.
                 self.registrar_decision_manual()
 
             if self.salto:
                 self.manejar_salto()
+
+            # Gestionar timer de agachado auto (inocuo si timer=0 o no está agachado)
+            self.manejar_agacharse()
 
             if not self.bala_disparada:
                 self.disparar_bala()
@@ -658,4 +780,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
